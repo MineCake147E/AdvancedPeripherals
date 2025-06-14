@@ -152,11 +152,6 @@ public class ItemFilter extends GenericFilter<ItemStack> {
         if (isEmpty())
             return true;
 
-        if (!fingerprint.isEmpty()) {
-            String testFingerprint = ItemUtil.getFingerprint(stack);
-            return fingerprint.equals(testFingerprint);
-        }
-
         if (item != Items.AIR && !stack.is(item)) {
             return false;
         }
@@ -165,6 +160,11 @@ public class ItemFilter extends GenericFilter<ItemStack> {
         }
         if (componentsAsNbt != null && !DataComponentUtil.toNbt(stack.getComponentsPatch()).equals(componentsAsNbt)) {
             return false;
+        }
+
+        if (!fingerprint.isEmpty()) {
+            String testFingerprint = ItemUtil.getFingerprint(stack);
+            return fingerprint.equals(testFingerprint);
         }
         return true;
     }

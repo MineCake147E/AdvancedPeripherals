@@ -1,5 +1,7 @@
 package de.srendi.advancedperipherals.common.addons.computercraft.peripheral;
 
+import appeng.api.config.Actionable;
+import appeng.api.config.FuzzyMode;
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.IGridNode;
 import appeng.api.networking.IManagedGridNode;
@@ -7,6 +9,8 @@ import appeng.api.networking.crafting.ICraftingCPU;
 import appeng.api.networking.crafting.ICraftingService;
 import appeng.api.stacks.AEFluidKey;
 import appeng.api.stacks.AEItemKey;
+import appeng.api.stacks.AEKey;
+import appeng.api.stacks.KeyCounter;
 import appeng.api.storage.MEStorage;
 import appeng.crafting.pattern.EncodedPatternItem;
 import dan200.computercraft.api.lua.IArguments;
@@ -15,6 +19,8 @@ import dan200.computercraft.api.lua.LuaFunction;
 import dan200.computercraft.api.lua.MethodResult;
 import dan200.computercraft.api.peripheral.IComputerAccess;
 import dan200.computercraft.core.apis.TableHelper;
+import dan200.computercraft.shared.util.WorldUtil;
+import de.srendi.advancedperipherals.AdvancedPeripherals;
 import de.srendi.advancedperipherals.common.addons.APAddon;
 import de.srendi.advancedperipherals.common.addons.appliedenergistics.AEApi;
 import de.srendi.advancedperipherals.common.addons.appliedenergistics.AECraftJob;
@@ -35,10 +41,14 @@ import de.srendi.advancedperipherals.common.util.inventory.IStorageSystemPeriphe
 import de.srendi.advancedperipherals.common.util.inventory.InventoryUtil;
 import de.srendi.advancedperipherals.common.util.inventory.ItemFilter;
 import de.srendi.advancedperipherals.lib.peripherals.BasePeripheral;
+import it.unimi.dsi.fastutil.objects.Object2LongMap;
 import me.ramidzkh.mekae2.ae2.MekanismKey;
 import mekanism.api.chemical.IChemicalHandler;
+import net.minecraft.core.Direction;
+import net.minecraft.world.item.Items;
 import net.neoforged.neoforge.fluids.capability.IFluidHandler;
 import net.neoforged.neoforge.items.IItemHandler;
+import org.apache.logging.log4j.Level;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -53,11 +63,13 @@ public class MEBridgePeripheral extends BasePeripheral<BlockEntityPeripheralOwne
 
     private final MEBridgeEntity bridge;
     private IGridNode node;
+    private final KeyCounter preAllocatedKeyCounter;
 
     public MEBridgePeripheral(MEBridgeEntity tileEntity) {
         super(PERIPHERAL_TYPE, new BlockEntityPeripheralOwner<>(tileEntity));
         this.bridge = tileEntity;
         this.node = tileEntity.getActionableNode();
+        this.preAllocatedKeyCounter = new KeyCounter();
     }
 
     public void setNode(IManagedGridNode node) {
@@ -81,14 +93,64 @@ public class MEBridgePeripheral extends BasePeripheral<BlockEntityPeripheralOwne
      * @return the exportable amount or null with a string if something went wrong
      */
     protected MethodResult exportToChest(@NotNull IArguments arguments, IItemHandler targetInventory) throws LuaException {
-        MEStorage monitor = AEApi.getMonitor(node);
-        MEItemHandler itemHandler = new MEItemHandler(monitor, bridge);
+        if (targetInventory == null)
+            return MethodResult.of(0, "Target Inventory does not exist");
+        var t = bridge;
+        var level = t.getLevel();
+        if (level == null)
+            return MethodResult.of(0, "The ME Bridge is in a null level!");
         Pair<ItemFilter, String> filter = ItemFilter.parse(arguments.getTable(0));
-
         if (filter.rightPresent())
             return MethodResult.of(0, filter.getRight());
-
-        return MethodResult.of(InventoryUtil.moveItem(itemHandler, targetInventory, filter.getLeft()), null);
+        MEStorage monitor = AEApi.getMonitor(node);
+        var itemFilter = filter.getLeft();
+        var cachedInventory = preAllocatedKeyCounter;
+        cachedInventory.clear();
+        monitor.getAvailableStacks(cachedInventory);
+        Iterable<Object2LongMap.Entry<AEKey>> entries = cachedInventory;
+        var item = itemFilter.getItem();
+        if (item != Items.AIR) {
+            // We can skip the non-matching items entirely by this step.
+            entries = cachedInventory.findFuzzy(AEItemKey.of(item), FuzzyMode.IGNORE_ALL);
+        }
+        int slot = Math.max(0, itemFilter.getToSlot());
+        int amount = itemFilter.getCount();
+        int totalExported = 0;
+        var slotMax = targetInventory.getSlots();
+        String message = null;
+        for (var entry : entries) {
+            if (slot >= slotMax || amount < 1) break;
+            // Skip the entry with amount 0 so we can skip the type check entirely regardless of the type of the key.
+            if (entry.getLongValue() < 1) continue;
+            if (entry.getKey() instanceof AEItemKey key && itemFilter.test(key.getReadOnlyStack())) {
+                // In order to avoid iterating over NetworkStorage.priorityInventory more than twice for the same item, we first modulate the NetworkStorage.
+                var extracted = (int) Math.min(monitor.extract(key, amount, Actionable.MODULATE, t), Integer.MAX_VALUE);
+                if (extracted < 1)  // Since the entries are cached one, we have to verify the amount we can extract.
+                    continue;
+                var stack = key.toStack(extracted);
+                if (stack.isEmpty()) continue;
+                do {
+                    stack = targetInventory.insertItem(slot, stack, false);
+                } while (!stack.isEmpty() && ++slot < slotMax);
+                int remaining = stack.getCount();
+                int exported = extracted - remaining;
+                amount -= exported;
+                totalExported += exported;
+                if (remaining > 0) {
+                    var returned = (int) monitor.insert(key, remaining, Actionable.MODULATE, t);
+                    var k = remaining - returned;
+                    if (k > 0) {
+                        totalExported += k;
+                        AdvancedPeripherals.LOGGER.log(Level.WARN, "Failed to return the remaining item to ME storage! Dropping the item above the ME Bridge instead!");
+                        stack.setCount(k);
+                        WorldUtil.dropItemStack(level, t.getBlockPos(), Direction.UP, stack);
+                        message = "WARNING: Failed to return the remaining item to ME storage! Dropped the item above the ME Bridge instead!";
+                    }
+                    break;
+                }
+            }
+        }
+        return MethodResult.of(totalExported, message);
     }
 
     /**
